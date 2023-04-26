@@ -2,15 +2,30 @@ const express = require("express");
 const app = express();
 const cors = require("cors");
 const pool = require("./db");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const cookieParser = require("cookie-parser");
+const verifyJWT = require("./middleware/verifyJWT");
 
 // middleware
-app.use(cors());
+
 app.use(express.json());
+app.use(cookieParser());
+
+app.use(function(req, res, next) {
+    res.header('Access-Control-Allow-Origin', "http://localhost:5173");
+    res.header('Access-Control-Allow-Credentials', true);
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
+});
+
+app.use(cors({
+    origin: 'http://localhost:5173'
+ }));
 
 // ROUTES
-
 // create a todo
-app.post("/todos", async (req, res) => {
+app.post("/api/todos", verifyJWT, async (req, res) => {
 	try {
 		const { title, description } = req.body;
 		const newTodo = await pool.query(
@@ -25,7 +40,9 @@ app.post("/todos", async (req, res) => {
 });
 
 // get all todos
-app.get("/todos", async (req, res) => {
+app.get("/api/todos", verifyJWT, async (req, res) => {
+    console.log(req.user);
+  
     try {
         const allTodos = await pool.query("SELECT * FROM todo");
         res.json(allTodos.rows);
@@ -35,7 +52,7 @@ app.get("/todos", async (req, res) => {
 });
 
 // get a todo
-app.get("/todos/:id", async (req, res) => {
+app.get("/api/todos/:id", verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         const todo = await pool.query("SELECT * FROM todo WHERE id = $1", [id]);
@@ -46,23 +63,25 @@ app.get("/todos/:id", async (req, res) => {
 });
 
 // update a todo
-app.put("/todos/:id", async (req, res) => {
+app.put("/api/todos/:id", verifyJWT, async (req, res) => {
+    
     try {
         const { id } = req.params;
-        const { title, description } = req.body;
+        const { title, description, completed } = req.body;
+
         const updateTodo = await pool.query(
-            "UPDATE todo SET title = $1, description = $2 WHERE id = $3",
-            [title, description, id]
-        );
-        res.json("Todo was updated!");
+            "UPDATE todo SET title = $1, description = $2, completed = $3 WHERE id = $4 RETURNING *",
+            [title, description, completed, id]
+        );       
+
+        res.json(updateTodo.rows[0]);
     } catch (err) {
         console.error(err.message);
     }
 });
 
-
 // delete a todo
-app.delete("/todos/:id", async (req, res) => {
+app.delete("/api/todos/:id", verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         const deleteTodo = await pool.query("DELETE FROM todo WHERE id = $1 RETURNING *", [id]);  
@@ -73,6 +92,109 @@ app.delete("/todos/:id", async (req, res) => {
 });
 
 
+app.post("/api/users", async (req, res) => {
+    const { email, password } = req.body;
+    try {
+        const salt = await bcrypt.genSalt();
+        const hashedPassword = await bcrypt.hash(password, salt);
+        const newUser = await pool.query(
+			"INSERT INTO \"user\" (email, password) VALUES($1, $2)",
+			[email, hashedPassword]
+		);
+        res.status(201).send("ok");
+    } catch (err) {
+       console.error(err.message);
+       res.status(500).send(err.message);
+    }
+
+});
+
+app.post("/api/users/login", async (req, res) => {
+    const { email, password } = req.body;
+    console.log(email, password)
+    try {
+        const user = await pool.query("SELECT * FROM \"user\" WHERE email = $1", [email]);
+        if (user.rows.length === 0) {
+            return res.status(400).send("User not found");
+        }
+        const validPassword = await bcrypt.compare(password, user.rows[0].password);
+        if (!validPassword) {
+            return res.status(400).send("Invalid password");
+        }
+        
+        const userId = user.rows[0].id;
+
+        const userInfo = { userId };
+        const accessToken = jwt.sign(userInfo, process.env.ACCESS_TOKEN_SECRET, { expiresIn: "30s" });
+        const refreshToken = jwt.sign(userInfo, process.env.REFRESH_TOKEN_SECRET, { expiresIn: "3d" });
+
+        const updateRefreshToken = await pool.query(
+            "UPDATE \"user\" SET refreshtoken = $1 WHERE id = $2",
+            [refreshToken, userId]
+        ); 
+        
+        res.cookie("refreshToken", refreshToken, { httpOnly: true, sameSite: "none", secure: true, maxAge: 3 * 24 * 60 * 60 * 1000 });
+        res.json({ accessToken });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send(err.message);
+    }
+
+});
+
+app.get("/api/users/logout", async (req, res) => {
+    const cookies = req.cookies;
+    if (!cookies?.refreshToken) return res.status(204).send("No refresh token"); 
+    const refreshToken = cookies.refreshToken;
+
+    try {
+        const user = await pool.query("SELECT * FROM \"user\" WHERE refreshtoken = $1", [refreshToken]);
+        if (user.rows.length === 0) {
+            res.clearCookie("refreshToken", { httpOnly: true, maxAge: 3 * 24 * 60 * 60 * 1000 });
+            return res.status(204).send("User not found");
+        }
+        const userId = user.rows[0].id;
+
+        const deleteRefreshToken = await pool.query("UPDATE \"user\" SET refreshtoken = NULL WHERE id = $1", [userId]);
+        res.clearCookie("refreshToken", { httpOnly: true, sameSite: "none", secure: true });
+        res.status(204).send("ok");
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send(err.message);
+    }
+});
+
+
+app.get("/api/users/refreshaccesstoken", async (req, res) => {
+    const cookies = req.cookies;
+    if (!cookies?.refreshToken) return res.status(401).send("No refresh token");    
+    const refreshToken = cookies.refreshToken;
+
+    try {
+        const user = await pool.query("SELECT * FROM \"user\" WHERE refreshtoken = $1", [refreshToken]);
+        if (user.rows.length === 0) {
+            return res.status(400).send("User not found");
+        }
+        const userId = user.rows[0].id;
+
+        jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET, async (err, payload) => {
+            if (err || userId !== payload.userId) return res.status(403).send("Invalid refresh token");
+        
+            const userInfo = { userId };
+            const accessToken = jwt.sign(userInfo, process.env.ACCESS_TOKEN_SECRET, { expiresIn: "30s" });
+            // const refreshToken = jwt.sign(userInfo, process.env.REFRESH_TOKEN_SECRET, { expiresIn: "3d" });
+    
+            // const updateRefreshToken = await pool.query("UPDATE \"user\" SET refreshtoken = $1 WHERE id = $2", [refreshToken, userId]);
+            // res.cookie("refreshToken", refreshToken, { httpOnly: true, maxAge: 3 * 24 * 60 * 60 * 1000 });
+            res.json({ accessToken });        
+        
+        });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send(err.message);
+    }
+});
+    
 app.listen(5000, () => {
 	console.log("server is listening on port 5000");
 });
