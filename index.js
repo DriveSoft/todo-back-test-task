@@ -6,49 +6,48 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
 const verifyJWT = require("./middleware/verifyJWT");
+const { validateSignup, validateLogin, validateTodo } = require("./validator");
 
 // middleware
-
 app.use(express.json());
 app.use(cookieParser());
-
-app.use(function(req, res, next) {
-    res.header('Access-Control-Allow-Origin', "http://localhost:5173");
-    res.header('Access-Control-Allow-Credentials', true);
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    next();
-});
-
 app.use(cors({
-    origin: 'http://localhost:5173'
- }));
+    origin: 'http://localhost:5173',
+    credentials: true
+}));
 
 // ROUTES
-// create a todo
-app.post("/api/todos", verifyJWT, async (req, res) => {
-	try {
-		const { title, description } = req.body;
-		const newTodo = await pool.query(
-			"INSERT INTO todo (title, description) VALUES($1, $2) RETURNING *",
-			[title, description]
-		);
-
-        res.json(newTodo.rows[0]);
-	} catch (err) {
-		console.error(err.message);
-	}
-});
 
 // get all todos
 app.get("/api/todos", verifyJWT, async (req, res) => {
     console.log(req.user);
   
     try {
-        const allTodos = await pool.query("SELECT * FROM todo");
+        const allTodos = await pool.query("SELECT * FROM todo WHERE user_id = $1", [req.user.userId]);
         res.json(allTodos.rows);
     } catch (err) {
         console.error(err.message);
     }
+});
+
+// create a todo
+app.post("/api/todos", verifyJWT, async (req, res) => {
+	const { error, value } = validateTodo(req.body);   
+    if (error) {
+        console.log(error.details);
+        return res.status(400).send(error.details[0].message);
+    }     
+
+    try {
+		const newTodo = await pool.query(
+			"INSERT INTO todo (title, description, completed, user_id) VALUES($1, $2, $3, $4) RETURNING *",
+			[value.title, value.description, value.completed, req.user.userId]
+		);
+
+        res.json(newTodo.rows[0]);
+	} catch (err) {
+		console.error(err.message);
+	}
 });
 
 // get a todo
@@ -64,14 +63,17 @@ app.get("/api/todos/:id", verifyJWT, async (req, res) => {
 
 // update a todo
 app.put("/api/todos/:id", verifyJWT, async (req, res) => {
-    
+    const { error, value } = validateTodo(req.body);   
+    if (error) {
+        console.log(error.details);
+        return res.status(400).send(error.details[0].message);
+    }  
+
     try {
         const { id } = req.params;
-        const { title, description, completed } = req.body;
-
         const updateTodo = await pool.query(
             "UPDATE todo SET title = $1, description = $2, completed = $3 WHERE id = $4 RETURNING *",
-            [title, description, completed, id]
+            [value.title, value.description, value.completed, id]
         );       
 
         res.json(updateTodo.rows[0]);
@@ -93,13 +95,17 @@ app.delete("/api/todos/:id", verifyJWT, async (req, res) => {
 
 
 app.post("/api/users", async (req, res) => {
-    const { email, password } = req.body;
+    const { error, value } = validateSignup(req.body);   
+    if (error) {
+        return res.status(400).send(error.details[0].message);
+    }    
+    
     try {
         const salt = await bcrypt.genSalt();
-        const hashedPassword = await bcrypt.hash(password, salt);
+        const hashedPassword = await bcrypt.hash(value.password, salt);
         const newUser = await pool.query(
 			"INSERT INTO \"user\" (email, password) VALUES($1, $2)",
-			[email, hashedPassword]
+			[value.email, hashedPassword]
 		);
         res.status(201).send("ok");
     } catch (err) {
@@ -110,14 +116,18 @@ app.post("/api/users", async (req, res) => {
 });
 
 app.post("/api/users/login", async (req, res) => {
-    const { email, password } = req.body;
-    console.log(email, password)
+    const { error, value } = validateLogin(req.body);   
+    if (error) {
+        console.log(error.details);
+        return res.status(400).send(error.details[0].message);
+    } 
+
     try {
-        const user = await pool.query("SELECT * FROM \"user\" WHERE email = $1", [email]);
+        const user = await pool.query("SELECT * FROM \"user\" WHERE email = $1", [value.email]);
         if (user.rows.length === 0) {
             return res.status(400).send("User not found");
         }
-        const validPassword = await bcrypt.compare(password, user.rows[0].password);
+        const validPassword = await bcrypt.compare(value.password, user.rows[0].password);
         if (!validPassword) {
             return res.status(400).send("Invalid password");
         }
@@ -182,10 +192,6 @@ app.get("/api/users/refreshaccesstoken", async (req, res) => {
         
             const userInfo = { userId };
             const accessToken = jwt.sign(userInfo, process.env.ACCESS_TOKEN_SECRET, { expiresIn: "30s" });
-            // const refreshToken = jwt.sign(userInfo, process.env.REFRESH_TOKEN_SECRET, { expiresIn: "3d" });
-    
-            // const updateRefreshToken = await pool.query("UPDATE \"user\" SET refreshtoken = $1 WHERE id = $2", [refreshToken, userId]);
-            // res.cookie("refreshToken", refreshToken, { httpOnly: true, maxAge: 3 * 24 * 60 * 60 * 1000 });
             res.json({ accessToken });        
         
         });
